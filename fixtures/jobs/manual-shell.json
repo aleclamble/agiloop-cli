@@ -1,0 +1,52 @@
+{
+  "schema_version": "scheduler.job.v1",
+  "name": "manual-shell",
+  "enabled": true,
+  "provider_id": "shell",
+  "repo": {
+    "path": "/tmp",
+    "base_ref": "main",
+    "fetch_before_run": false
+  },
+  "schedule": {
+    "kind": "manual"
+  },
+  "task": {
+    "prompt": "Print this prompt back as a smoke test.",
+    "success_criteria": [
+      "Provider stdout contains the task prompt."
+    ]
+  },
+  "execution": {
+    "isolation": "none",
+    "concurrency": "skip",
+    "repo_lock": "none",
+    "timeout_seconds": 10,
+    "approval_policy": "non_interactive",
+    "branch_template": "scheduler/{job_slug}/{run_id}",
+    "worktree_cleanup": {
+      "on_success": "after_retention",
+      "on_failure": "keep",
+      "retention_days": 14
+    }
+  },
+  "delivery": {
+    "mode": "artifact_only",
+    "require_summary": true,
+    "require_clean_worktree": false
+  },
+  "notifications": {
+    "on_success": [],
+    "on_failure": [
+      "local"
+    ],
+    "on_timeout": [
+      "local"
+    ]
+  },
+  "metadata": {
+    "source": "fixture",
+    "source_text": "Manual shell smoke test.",
+    "created_by_provider_id": "shell"
+  }
+}

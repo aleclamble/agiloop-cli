@@ -1,0 +1,32 @@
+[package]
+name = "scheduler-cli"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "scheduler"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+crossterm.workspace = true
+directories.workspace = true
+ratatui.workspace = true
+scheduler-core = { path = "../scheduler-core" }
+scheduler-daemon = { path = "../scheduler-daemon" }
+scheduler-logs = { path = "../scheduler-logs" }
+scheduler-provider = { path = "../scheduler-provider" }
+scheduler-store = { path = "../scheduler-store" }
+scheduler-tui = { path = "../scheduler-tui" }
+serde_json.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

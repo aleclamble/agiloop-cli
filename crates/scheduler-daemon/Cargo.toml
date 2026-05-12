@@ -1,0 +1,23 @@
+[package]
+name = "scheduler-daemon"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+scheduler-git = { path = "../scheduler-git" }
+scheduler-logs = { path = "../scheduler-logs" }
+scheduler-core = { path = "../scheduler-core" }
+scheduler-provider = { path = "../scheduler-provider" }
+scheduler-store = { path = "../scheduler-store" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

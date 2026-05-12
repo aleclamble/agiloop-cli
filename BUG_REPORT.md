@@ -2,78 +2,118 @@
 
 Generated: 2026-05-12
 
-This report lists the current bugs found by inspecting the repository and running the workspace validation commands. The Rust workspace compiles, but the full test suite currently fails in the CLI smoke tests.
+This report captures the current confirmed bugs found by running the workspace test suite and inspecting the implicated code paths. It is intentionally limited to reproducible failures in the current checkout.
 
-## Validation Summary
+## Summary
 
-| Command | Result | Notes |
-| --- | --- | --- |
-| `CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo check --workspace` | Passes with warnings | `scheduler-cli` reports one dead-code warning for `xml_escape` in `crates/scheduler-cli/src/main.rs`. |
-| `CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace` | Fails | `crates/scheduler-cli/tests/cli_smoke.rs` has 2 failing tests and 7 passing tests before the suite stops. |
+| ID | Severity | Area | Status |
+| --- | --- | --- | --- |
+| BUG-001 | High | CLI run cancellation | Confirmed by failing test |
+| BUG-002 | High | Daemon lifecycle status | Confirmed by failing test |
 
-## Current Bugs
+## BUG-001: Cancelling an active custom-provider run fails with `No such file or directory`
 
-### 1. Custom provider run cancellation fails before the provider process starts
+### Impact
 
-- **Status:** Open
-- **Severity:** High
-- **Area:** CLI provider execution and cancellation
-- **Failing test:** `cancel_terminates_active_provider_process` in `crates/scheduler-cli/tests/cli_smoke.rs`
-- **Observed failure:**
+Users may be unable to cancel a running job backed by a custom provider. The active run command can fail with a provider command error before cancellation completes, leaving the operator without reliable cancellation behavior.
+
+### Evidence
+
+Command:
+
+```bash
+CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace
+```
+
+Failure:
 
 ```text
+cancel_terminates_active_provider_process ... FAILED
+
+thread 'cancel_terminates_active_provider_process' panicked at crates/scheduler-cli/tests/cli_smoke.rs:866:5:
 Error: provider command failed: No such file or directory (os error 2)
 ```
 
-- **Expected behavior:** A custom provider added with an executable path should start successfully, the run should enter `running`, `scheduler cancel <run_id>` should terminate the active provider process, and the run should end in `cancelled`.
-- **Actual behavior:** The run command exits with a provider command lookup failure before cancellation can complete.
-- **Evidence:** The failing test registers a custom provider from an absolute temp-file path through `scheduler provider add-custom sleeper <provider-path>`, creates a job that uses provider `sleeper`, then starts `scheduler run cancellable`. The command fails with `No such file or directory`.
-- **Likely impact:** Users who configure custom providers can create jobs that cannot be executed or cancelled, even when the provider executable exists and is executable.
-- **Likely investigation path:** Check persistence and retrieval of `ProviderConfig.command` across `provider add-custom`, `Store::upsert_provider`, and provider invocation. The failing path suggests the stored command is not being resolved back to the intended executable when `RunExecutor` launches the provider.
+Relevant files:
 
-### 2. `scheduler daemon start` returns success while the daemon is not running
+- `crates/scheduler-cli/tests/cli_smoke.rs`
+- `crates/scheduler-cli/src/main.rs`
+- `crates/scheduler-daemon/src/lib.rs`
+- `crates/scheduler-provider/src/lib.rs`
 
-- **Status:** Open
-- **Severity:** High
-- **Area:** Daemon lifecycle
-- **Failing test:** `daemon_start_status_and_stop_manage_background_process` in `crates/scheduler-cli/tests/cli_smoke.rs`
-- **Observed failure:**
+### Notes
 
-```json
-{
+The failing smoke test registers a temporary executable custom provider, starts `scheduler run cancellable`, waits for the run to reach `running`, then invokes `scheduler cancel <run_id>`. The provider invocation path creates a process group and records the process id so the cancel command can terminate it. The observed `No such file or directory` error comes from the provider command execution path rather than a clean cancellation transition.
+
+### Expected Behavior
+
+The cancel command should terminate the active provider process group, the run should end in `cancelled`, and the provider script should not complete its post-loop marker write.
+
+## BUG-002: Started daemon is reported as not running even while heartbeat metadata is present
+
+### Impact
+
+The CLI reports the daemon as stopped after `scheduler daemon start`, even though daemon metadata such as `started_at`, `heartbeat_at`, and `last_tick_at` is being written. This can break status checks, scripts, health monitoring, and operator confidence in background scheduling.
+
+### Evidence
+
+Command:
+
+```bash
+CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace
+```
+
+Failure:
+
+```text
+daemon_start_status_and_stop_manage_background_process ... FAILED
+
+daemon running state did not become `true`; last output: {
   "pid": 0,
   "running": false,
-  "database_path": "/tmp/.tmpddIpBz/config/data/scheduler.sqlite3",
+  "database_path": "/tmp/.tmp7MMt5o/config/data/scheduler.sqlite3",
   "active_runs": 0,
   "next_due_run": null,
-  "started_at": "2026-05-12T20:50:55.041608833Z",
-  "heartbeat_at": "2026-05-12T20:50:59.128637377Z",
-  "last_tick_at": "2026-05-12T20:50:59.140029460Z",
+  "started_at": "2026-05-12T23:52:44.777370966Z",
+  "heartbeat_at": "2026-05-12T23:52:48.830857177Z",
+  "last_tick_at": "2026-05-12T23:52:48.839567093Z",
   "last_error": ""
 }
 ```
 
-- **Expected behavior:** After `scheduler daemon start`, `scheduler --json daemon status` should report `running: true` with a non-zero daemon PID until `scheduler daemon stop` is called.
-- **Actual behavior:** The start command succeeds, the status record has recent heartbeat data, but status reports `running: false` and `pid: 0`.
-- **Evidence:** `start_daemon` spawns `current_exe() --config <dir> daemon run` and writes the child PID to both the pid file and the store. The status path reports the daemon as not running while database heartbeat fields continue to update.
-- **Likely impact:** Users and automation cannot reliably tell whether the background daemon is alive. Stop/restart behavior may also be unreliable when status and PID tracking disagree.
-- **Likely investigation path:** Inspect `daemon_status` and its interaction with `daemon_status_snapshot`, `read_daemon_pid`, and `is_process_running`. The snapshot can report `running: true` from heartbeat data, but the CLI status path appears to override or clear that state when PID validation fails.
+Relevant files:
 
-## Non-Failing Issue
+- `crates/scheduler-cli/tests/cli_smoke.rs`
+- `crates/scheduler-cli/src/main.rs`
+- `crates/scheduler-daemon/src/lib.rs`
 
-### 3. Unused `xml_escape` helper
+### Notes
 
-- **Status:** Open
-- **Severity:** Low
-- **Area:** CLI code hygiene
-- **Location:** `crates/scheduler-cli/src/main.rs`
-- **Observed warning:**
+The status output shows fresh daemon heartbeat and tick timestamps, but `pid` is `0` and `running` is `false`. The CLI status path appears to be unable to correlate the live daemon metadata with a valid running pid, or the pid file/process check is becoming invalid while the daemon loop still updates the store.
+
+### Expected Behavior
+
+After `scheduler daemon start`, `scheduler --json daemon status` should report `running: true` with a non-zero pid until the daemon is stopped.
+
+## Additional Observation
+
+The test run also emits a warning:
 
 ```text
 warning: function `xml_escape` is never used
 ```
 
-- **Expected behavior:** The workspace should build without dead-code warnings, or unused helpers should be removed.
-- **Actual behavior:** `cargo check --workspace` succeeds but emits the warning.
-- **Likely impact:** Low runtime impact, but it adds noise to validation output and can hide more important warnings over time.
+This is not classified as a functional bug because it does not currently fail the workspace test suite, but it will become build-breaking if CI runs clippy or compiler warnings as errors.
 
+## Validation
+
+The workspace test suite was run on 2026-05-12 with writable Cargo directories:
+
+```bash
+CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace
+```
+
+Result: failed with 7 passing CLI smoke tests and 2 failing CLI smoke tests:
+
+- `cancel_terminates_active_provider_process`
+- `daemon_start_status_and_stop_manage_background_process`

@@ -1,8 +1,17 @@
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 fn scheduler() -> Command {
     Command::new(env!("CARGO_BIN_EXE_scheduler"))
+}
+
+static DAEMON_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn daemon_test_lock() -> MutexGuard<'static, ()> {
+    DAEMON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[test]
@@ -40,6 +49,7 @@ fn setup_records_provider_probe_history() {
 
 #[test]
 fn daemon_start_status_and_stop_manage_background_process() {
+    let _daemon_test_lock = daemon_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("config");
 
@@ -67,6 +77,7 @@ fn daemon_start_status_and_stop_manage_background_process() {
 
 #[test]
 fn scheduled_job_creation_starts_daemon() {
+    let _daemon_test_lock = daemon_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("config");
     let provider = temp.path().join("provider.sh");

@@ -17,6 +17,7 @@ clap.workspace = true
 clap_complete.workspace = true
 crossterm.workspace = true
 directories.workspace = true
+libc.workspace = true
 ratatui.workspace = true
 scheduler-core = { path = "../scheduler-core" }
 scheduler-daemon = { path = "../scheduler-daemon" }

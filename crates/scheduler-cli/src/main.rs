@@ -2002,11 +2002,7 @@ fn clear_daemon_pid(paths: &AppPaths) -> Result<()> {
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .is_ok_and(|status| status.success())
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 #[cfg(windows)]
@@ -2020,20 +2016,14 @@ fn is_process_running(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn terminate_process(pid: u32) -> Result<()> {
-    let _ = std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status();
+    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     for _ in 0..25 {
         if !is_process_running(pid) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = std::process::Command::new("kill")
-        .arg("-KILL")
-        .arg(pid.to_string())
-        .status();
+    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     Ok(())
 }
 

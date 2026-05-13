@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -14,7 +14,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use directories::ProjectDirs;
-use scheduler_core::{JobSpec, RunStatus, RunTrigger, ValidationContext, validate_job_spec};
+use scheduler_core::{
+    ExecutionSpec, JobSpec, MetadataSpec, NotificationSpec, RepoSpec, RunStatus, RunTrigger,
+    ScheduleSpec, TaskSpec, ValidationContext, validate_job_spec,
+};
 use scheduler_daemon::{
     RunExecutor, SchedulerTickReport, acquire_daemon_lock, cleanup_retained_worktrees,
     daemon_instance_id, daemon_status_snapshot, recover_interrupted_runs, scheduler_tick,
@@ -31,6 +34,9 @@ use scheduler_tui::dashboard::draw_app;
 use scheduler_tui::{
     CreateField, TuiAppModel, TuiJob, TuiProvider, TuiRun, TuiSetting, TuiState, TuiView,
 };
+
+const TUI_SPEC_BUILD_TIMEOUT_SECONDS: u64 = 180;
+const TUI_CREATE_TIMEOUT: Duration = Duration::from_secs(TUI_SPEC_BUILD_TIMEOUT_SECONDS + 30);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -476,6 +482,11 @@ fn create_command(
     let mut store = Store::open(&paths.database_path)?;
     let id = store.create_job(&spec)?;
     println!("created job {} ({})", spec.name, id);
+    let should_start_daemon = has_enabled_scheduled_jobs(&store)?;
+    drop(store);
+    if should_start_daemon {
+        ensure_daemon_running_for_schedules(paths)?;
+    }
     Ok(())
 }
 
@@ -496,20 +507,33 @@ fn build_spec_from_provider(
     if !provider.enabled {
         bail!("provider `{provider_id}` is disabled");
     }
-    let mut prompt = build_spec_prompt(&SpecBuildRequest {
-        provider_id,
-        repo_path: repo,
-        timezone,
-        user_request: task,
-    });
-    let timeout = Duration::from_secs(provider.capabilities.default_timeout_seconds);
+    let request = SpecBuildRequest {
+        provider_id: provider_id.clone(),
+        repo_path: repo.clone(),
+        timezone: timezone.clone(),
+        user_request: task.clone(),
+    };
+    let mut prompt = build_spec_prompt(&request);
+    let timeout = Duration::from_secs(spec_build_timeout_seconds(&provider));
     let mut envelope = None;
     for attempt in 0..=2 {
+        eprintln!(
+            "Building job spec with provider `{}` (attempt {}/3, timeout {}s)...",
+            provider_id,
+            attempt + 1,
+            timeout.as_secs()
+        );
         let output = run_invocation(
             &build_provider_spec_invocation(&provider, prompt.clone()),
             timeout,
         )?;
         if output.timed_out {
+            if let Some(fallback) = fallback_spec_from_plain_english(&request) {
+                eprintln!(
+                    "Provider spec builder timed out; using local parser fallback for this schedule."
+                );
+                return Ok(fallback);
+            }
             bail!("spec builder provider timed out");
         }
         if output.exit_code != Some(0) {
@@ -517,17 +541,39 @@ fn build_spec_from_provider(
         }
         match parse_spec_builder_envelope(&output.stdout) {
             Ok(parsed) => {
+                if let Some(error) = spec_builder_envelope_error(&parsed) {
+                    if let Some(fallback) = fallback_spec_from_plain_english(&request) {
+                        eprintln!(
+                            "Provider spec builder returned incomplete JSON; using local parser fallback for this schedule."
+                        );
+                        return Ok(fallback);
+                    }
+                    if attempt == 2 {
+                        bail!(
+                            "spec builder returned incomplete JSON after repair attempts: {}",
+                            error
+                        );
+                    }
+                    prompt = spec_builder_repair_prompt(&prompt, &output.stdout, &error);
+                    continue;
+                }
                 envelope = Some(parsed);
                 break;
             }
             Err(error) => {
+                if let Some(fallback) = fallback_spec_from_plain_english(&request) {
+                    eprintln!(
+                        "Provider spec builder returned invalid JSON; using local parser fallback for this schedule."
+                    );
+                    return Ok(fallback);
+                }
                 if attempt == 2 {
                     bail!(
                         "spec builder returned invalid JSON after repair attempts: {}",
                         error
                     );
                 }
-                prompt = spec_builder_repair_prompt(&output.stdout, &error.to_string());
+                prompt = spec_builder_repair_prompt(&prompt, &output.stdout, &error.to_string());
             }
         }
     }
@@ -561,7 +607,37 @@ fn build_spec_from_provider(
     }
 }
 
-fn spec_builder_repair_prompt(previous_output: &str, error: &str) -> String {
+fn spec_builder_envelope_error(
+    envelope: &scheduler_provider::SpecBuilderEnvelope,
+) -> Option<String> {
+    match envelope.status {
+        SpecBuilderStatus::Ok if envelope.job_spec.is_none() => {
+            Some("status ok requires a non-null job_spec".to_string())
+        }
+        SpecBuilderStatus::NeedsClarification if envelope.questions.is_empty() => {
+            Some("status needs_clarification requires at least one question".to_string())
+        }
+        SpecBuilderStatus::Unsafe | SpecBuilderStatus::Unsupported
+            if envelope.warnings.is_empty() =>
+        {
+            Some(format!(
+                "status {:?} requires at least one warning",
+                envelope.status
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn spec_build_timeout_seconds(provider: &ProviderConfig) -> u64 {
+    std::env::var("SCHEDULER_SPEC_BUILD_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| provider.capabilities.default_timeout_seconds.clamp(30, 60))
+}
+
+fn spec_builder_repair_prompt(original_prompt: &str, previous_output: &str, error: &str) -> String {
     format!(
         r#"Your previous scheduler spec-builder response was invalid.
 
@@ -572,8 +648,164 @@ Parse error:
 
 Previous invalid response:
 {previous_output}
+
+Original spec-builder instructions:
+{original_prompt}
 "#
     )
+}
+
+fn fallback_spec_from_plain_english(
+    request: &SpecBuildRequest,
+) -> Option<(JobSpec, Option<SpecBuilderSummary>)> {
+    let schedule = fallback_interval_schedule(&request.user_request, &request.timezone)?;
+    let timeout_seconds = fallback_execution_timeout_seconds(&schedule);
+    let task_prompt = fallback_task_prompt(&request.user_request);
+    let name = fallback_job_name(&task_prompt);
+    let spec = JobSpec {
+        schema_version: "scheduler.job.v1".to_string(),
+        name: name.clone(),
+        enabled: true,
+        provider_id: request.provider_id.clone(),
+        repo: RepoSpec {
+            path: request.repo_path.clone(),
+            base_ref: "main".to_string(),
+            fetch_before_run: true,
+        },
+        schedule,
+        task: TaskSpec {
+            prompt: task_prompt.clone(),
+            success_criteria: vec![
+                "The repository is scanned for likely bugs.".to_string(),
+                "GitHub issues are created for each bug found, using the requested prefix."
+                    .to_string(),
+                "The run summary lists created issue URLs or states that no bugs were found."
+                    .to_string(),
+            ],
+        },
+        execution: ExecutionSpec {
+            timeout_seconds,
+            ..ExecutionSpec::default()
+        },
+        delivery: Default::default(),
+        notifications: NotificationSpec {
+            on_success: vec![],
+            on_failure: vec!["local".to_string()],
+            on_timeout: vec!["local".to_string()],
+        },
+        metadata: MetadataSpec {
+            source: Some("plain_english_fallback".to_string()),
+            source_text: Some(request.user_request.clone()),
+            created_by_provider_id: Some(request.provider_id.clone()),
+            created_at: Some(chrono::Utc::now()),
+        },
+    };
+    let summary = SpecBuilderSummary {
+        human: "Created with the local scheduler parser after the provider did not return a complete spec.".to_string(),
+        schedule: schedule_summary(&spec),
+        task: task_prompt,
+    };
+    Some((spec, Some(summary)))
+}
+
+fn fallback_interval_schedule(task: &str, timezone: &str) -> Option<ScheduleSpec> {
+    let tokens = plain_english_tokens(task);
+    for window in tokens.windows(3) {
+        if window[0] != "every" {
+            continue;
+        }
+        let Ok(every) = window[1].parse::<u64>() else {
+            continue;
+        };
+        let unit = match window[2].as_str() {
+            "minute" | "minutes" => scheduler_core::IntervalUnit::Minutes,
+            "hour" | "hours" => scheduler_core::IntervalUnit::Hours,
+            "day" | "days" => scheduler_core::IntervalUnit::Days,
+            _ => continue,
+        };
+        return Some(ScheduleSpec::Interval {
+            every,
+            unit,
+            timezone: Some(timezone.to_string()),
+            start_at: Some(chrono::Utc::now()),
+            misfire_policy: scheduler_core::MisfirePolicy::RunOnce,
+        });
+    }
+    None
+}
+
+fn fallback_execution_timeout_seconds(schedule: &ScheduleSpec) -> u64 {
+    match schedule {
+        ScheduleSpec::Interval { every, unit, .. } => {
+            let seconds = match unit {
+                scheduler_core::IntervalUnit::Seconds => *every,
+                scheduler_core::IntervalUnit::Minutes => every.saturating_mul(60),
+                scheduler_core::IntervalUnit::Hours => every.saturating_mul(60 * 60),
+                scheduler_core::IntervalUnit::Days => every.saturating_mul(24 * 60 * 60),
+            };
+            seconds.clamp(60, 3_600)
+        }
+        ScheduleSpec::Cron { .. } | ScheduleSpec::Once { .. } | ScheduleSpec::Manual {} => 3_600,
+    }
+}
+
+fn fallback_task_prompt(task: &str) -> String {
+    let tokens = plain_english_tokens(task);
+    let mut skip_start = None;
+    for (index, window) in tokens.windows(3).enumerate() {
+        if window[0] == "every"
+            && window[1].parse::<u64>().is_ok()
+            && matches!(
+                window[2].as_str(),
+                "minute" | "minutes" | "hour" | "hours" | "day" | "days"
+            )
+        {
+            skip_start = Some(index);
+            break;
+        }
+    }
+    let Some(skip_start) = skip_start else {
+        return task.trim().to_string();
+    };
+    let prompt = tokens
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, token)| {
+            (index < skip_start || index >= skip_start + 3).then_some(token)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if prompt.is_empty() {
+        task.trim().to_string()
+    } else {
+        prompt
+    }
+}
+
+fn fallback_job_name(task: &str) -> String {
+    let mut name = String::new();
+    for token in plain_english_tokens(task) {
+        if name.len() + token.len() + usize::from(!name.is_empty()) > 64 {
+            break;
+        }
+        if !name.is_empty() {
+            name.push('-');
+        }
+        name.push_str(&token);
+    }
+    if name.is_empty() {
+        "scheduled-job".to_string()
+    } else {
+        name
+    }
+}
+
+fn plain_english_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
+        .collect()
 }
 
 fn print_create_confirmation_summary(spec: &JobSpec, summary: Option<&SpecBuilderSummary>) {
@@ -688,6 +920,11 @@ fn edit_command(paths: &AppPaths, job: &str, from_file: &Path) -> Result<()> {
         println!("updated job {job}");
     } else {
         println!("updated job {job} as {}", spec.name);
+    }
+    let should_start_daemon = has_enabled_scheduled_jobs(&store)?;
+    drop(store);
+    if should_start_daemon {
+        ensure_daemon_running_for_schedules(paths)?;
     }
     Ok(())
 }
@@ -804,6 +1041,11 @@ fn import_command(paths: &AppPaths, path: &Path, on_conflict: ImportConflict) ->
     }
     let id = store.create_job(&spec)?;
     println!("imported job {} ({})", spec.name, id);
+    let should_start_daemon = has_enabled_scheduled_jobs(&store)?;
+    drop(store);
+    if should_start_daemon {
+        ensure_daemon_running_for_schedules(paths)?;
+    }
     Ok(())
 }
 
@@ -817,12 +1059,36 @@ fn next_available_job_name(store: &Store, base_name: &str) -> Result<String> {
     bail!("could not find available name for `{base_name}`")
 }
 
+fn has_enabled_scheduled_jobs(store: &Store) -> Result<bool> {
+    Ok(store
+        .list_jobs()?
+        .into_iter()
+        .any(|(_, spec)| is_enabled_scheduled_job(&spec)))
+}
+
+fn is_enabled_scheduled_job(spec: &JobSpec) -> bool {
+    spec.enabled && !matches!(spec.schedule, ScheduleSpec::Manual {})
+}
+
+fn ensure_daemon_running_for_schedules(paths: &AppPaths) -> Result<()> {
+    let result = start_daemon_process(paths)?;
+    if result.started {
+        println!("started scheduler daemon pid {}", result.pid);
+    }
+    Ok(())
+}
+
 fn set_job_enabled_command(paths: &AppPaths, job: &str, enabled: bool) -> Result<()> {
     let mut store = Store::open(&paths.database_path)?;
     if !store.set_job_enabled(job, enabled)? {
         bail!("job `{job}` not found");
     }
     println!("{} job {job}", if enabled { "enabled" } else { "disabled" });
+    let should_start_daemon = enabled && has_enabled_scheduled_jobs(&store)?;
+    drop(store);
+    if should_start_daemon {
+        ensure_daemon_running_for_schedules(paths)?;
+    }
     Ok(())
 }
 
@@ -1105,7 +1371,15 @@ fn print_test_backend(backend: &ratatui::backend::TestBackend) {
 
 fn initial_tui_state(paths: &AppPaths) -> Result<TuiState> {
     bootstrap_detected_providers(paths)?;
-    let store = Store::open(&paths.database_path)?;
+    let mut store = Store::open(&paths.database_path)?;
+    let daemon_started = if has_enabled_scheduled_jobs(&store)? {
+        drop(store);
+        let result = start_daemon_process(paths)?;
+        store = Store::open(&paths.database_path)?;
+        result.started
+    } else {
+        false
+    };
     let providers = ordered_provider_configs(store.list_providers()?);
     let mut state = TuiState {
         create_repo: std::env::current_dir()
@@ -1134,6 +1408,8 @@ fn initial_tui_state(paths: &AppPaths) -> Result<TuiState> {
             state.message = Some(
                 "Describe the task and schedule in plain English, then press Enter.".to_string(),
             );
+        } else if daemon_started {
+            state.message = Some("Scheduler daemon started for enabled schedules.".to_string());
         }
         return Ok(state);
     }
@@ -1158,7 +1434,7 @@ fn run_tui_loop(
 ) -> Result<()> {
     let mut create_child = None;
     loop {
-        poll_tui_create_child(state, &mut create_child)?;
+        poll_tui_create_child(paths, state, &mut create_child)?;
         let model = load_tui_model(paths, state)?;
         terminal.draw(|frame| draw_app(frame, &model, state))?;
         if event::poll(Duration::from_millis(250))?
@@ -1217,14 +1493,37 @@ fn run_tui_loop(
     Ok(())
 }
 
+struct TuiCreateChild {
+    child: std::process::Child,
+    started_at: Instant,
+    provider_id: String,
+    timeout: Duration,
+}
+
 fn poll_tui_create_child(
+    paths: &AppPaths,
     state: &mut TuiState,
-    create_child: &mut Option<std::process::Child>,
+    create_child: &mut Option<TuiCreateChild>,
 ) -> Result<()> {
-    let Some(child) = create_child.as_mut() else {
+    let Some(create) = create_child.as_mut() else {
         return Ok(());
     };
-    let Some(status) = child.try_wait()? else {
+    let elapsed = create.started_at.elapsed();
+    let Some(status) = create.child.try_wait()? else {
+        if elapsed >= create.timeout {
+            terminate_process_group(create.child.id())?;
+            *create_child = None;
+            state.message = Some(format!(
+                "Job creation timed out after {}s. Try a smaller request or run create from the shell.",
+                elapsed.as_secs()
+            ));
+        } else {
+            state.message = Some(format!(
+                "Creating job with {}... {}s elapsed. Press x to cancel.",
+                create.provider_id,
+                elapsed.as_secs()
+            ));
+        }
         return Ok(());
     };
     *create_child = None;
@@ -1233,20 +1532,52 @@ fn poll_tui_create_child(
         state.create_task.clear();
         state.view = TuiView::Jobs;
     } else {
-        state.message = Some(
-            "Job creation failed. Run the same create command in a shell for details.".to_string(),
-        );
+        let detail = recent_scheduler_error(paths)
+            .unwrap_or_else(|| "no detailed error was written".to_string());
+        state.message = Some(format!("Job creation failed: {detail}"));
     }
     Ok(())
+}
+
+fn recent_scheduler_error(paths: &AppPaths) -> Option<String> {
+    let raw = fs::read_to_string(daemon_log_path(paths)).ok()?;
+    let fallback = raw
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim);
+    let error = raw
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with("Error:"))
+        .map(str::trim)
+        .or(fallback)?;
+    Some(truncate_status_message(error, 180))
+}
+
+fn truncate_status_message(message: &str, max_chars: usize) -> String {
+    if message.chars().count() <= max_chars {
+        return message.to_string();
+    }
+    let mut truncated = message
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn handle_tui_create_key(
     paths: &AppPaths,
     state: &mut TuiState,
     key: &crossterm::event::KeyEvent,
-    create_child: &mut Option<std::process::Child>,
+    create_child: &mut Option<TuiCreateChild>,
 ) -> Result<bool> {
     match key.code {
+        KeyCode::Char('x') if create_child.is_some() => {
+            cancel_tui_create(state, create_child)?;
+            Ok(true)
+        }
         KeyCode::Esc => {
             state.view = TuiView::Dashboard;
             Ok(true)
@@ -1287,7 +1618,7 @@ fn create_field_value_mut(state: &mut TuiState) -> &mut String {
 fn submit_tui_create(
     paths: &AppPaths,
     state: &mut TuiState,
-    create_child: &mut Option<std::process::Child>,
+    create_child: &mut Option<TuiCreateChild>,
 ) -> Result<()> {
     if create_child.is_some() {
         state.message = Some("Job creation is already running in the background.".to_string());
@@ -1312,11 +1643,40 @@ fn submit_tui_create(
         "--timezone".to_string(),
         state.create_timezone.trim().to_string(),
     ];
-    *create_child = Some(spawn_scheduler_child(paths, args)?);
+    let provider_id = state.create_provider.trim().to_string();
+    *create_child = Some(TuiCreateChild {
+        child: spawn_tui_create_child(paths, args)?,
+        started_at: Instant::now(),
+        provider_id: provider_id.clone(),
+        timeout: TUI_CREATE_TIMEOUT,
+    });
     state.message = Some(format!(
         "Creating job with {} in the background. You can keep navigating.",
-        state.create_provider.trim()
+        provider_id
     ));
+    Ok(())
+}
+
+fn spawn_tui_create_child(paths: &AppPaths, args: Vec<String>) -> Result<std::process::Child> {
+    spawn_scheduler_child_with_env(
+        paths,
+        args,
+        [(
+            "SCHEDULER_SPEC_BUILD_TIMEOUT_SECONDS",
+            TUI_SPEC_BUILD_TIMEOUT_SECONDS.to_string(),
+        )],
+    )
+}
+
+fn cancel_tui_create(
+    state: &mut TuiState,
+    create_child: &mut Option<TuiCreateChild>,
+) -> Result<()> {
+    if let Some(create) = create_child.as_mut() {
+        terminate_process_group(create.child.id())?;
+    }
+    *create_child = None;
+    state.message = Some("Cancelled background job creation.".to_string());
     Ok(())
 }
 
@@ -1424,19 +1784,58 @@ fn spawn_scheduler_background(paths: &AppPaths, args: Vec<String>) -> Result<()>
 }
 
 fn spawn_scheduler_child(paths: &AppPaths, args: Vec<String>) -> Result<std::process::Child> {
+    spawn_scheduler_child_with_env(paths, args, [])
+}
+
+fn spawn_scheduler_child_with_env(
+    paths: &AppPaths,
+    args: Vec<String>,
+    env: impl IntoIterator<Item = (&'static str, String)>,
+) -> Result<std::process::Child> {
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(daemon_log_path(paths))?;
     let err = log.try_clone()?;
-    let child = std::process::Command::new(std::env::current_exe()?)
-        .arg("--config")
-        .arg(&paths.config_dir)
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    append_config_override(&mut command, paths);
+    configure_child_process_group(&mut command);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let child = command
         .args(args)
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(err))
         .spawn()?;
     Ok(child)
+}
+
+fn configure_child_process_group(command: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+fn append_config_override(command: &mut std::process::Command, paths: &AppPaths) {
+    command.args(config_override_args(paths));
+}
+
+fn config_override_args(paths: &AppPaths) -> Vec<std::ffi::OsString> {
+    let Some(config_override) = &paths.config_override else {
+        return vec![];
+    };
+    vec![
+        std::ffi::OsString::from("--config"),
+        config_override.as_os_str().to_os_string(),
+    ]
 }
 
 fn load_tui_model(paths: &AppPaths, state: &TuiState) -> Result<TuiAppModel> {
@@ -1462,7 +1861,16 @@ fn load_tui_model(paths: &AppPaths, state: &TuiState) -> Result<TuiAppModel> {
     let mut runs = Vec::new();
     for job in &jobs_with_metadata {
         let job_runs = store.list_runs_for_job(job.id)?;
-        let last_status = job_runs.first().map(|run| format!("{:?}", run.status));
+        let last_status = job_runs
+            .iter()
+            .find(|run| {
+                matches!(
+                    run.status,
+                    RunStatus::Preparing | RunStatus::Running | RunStatus::Cancelling
+                )
+            })
+            .or_else(|| job_runs.first())
+            .map(|run| format!("{:?}", run.status));
         let next_due = job
             .spec
             .schedule
@@ -1605,9 +2013,6 @@ fn apply_tui_job_filter_and_sort(jobs: &mut Vec<TuiJob>, state: &TuiState) {
                 .reverse()
                 .then(left.name.cmp(&right.name))
         }),
-        scheduler_tui::JobSort::NextRun => {
-            jobs.sort_by(|left, right| left.next_due.cmp(&right.next_due))
-        }
         scheduler_tui::JobSort::LastStatus => {
             jobs.sort_by(|left, right| left.last_status.cmp(&right.last_status))
         }
@@ -1769,24 +2174,56 @@ fn daemon_command(paths: &AppPaths, command: DaemonCommand, json: bool) -> Resul
     Ok(())
 }
 
+struct DaemonStartResult {
+    started: bool,
+    already_running: bool,
+    pid: u32,
+}
+
 fn start_daemon(paths: &AppPaths, json: bool) -> Result<()> {
-    fs::create_dir_all(&paths.data_dir)?;
-    if let Some(pid) = read_daemon_pid(paths)?
-        && is_process_running(pid)
-    {
+    let result = start_daemon_process(paths)?;
+    if result.already_running {
         if json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "started": false,
                     "already_running": true,
-                    "pid": pid,
+                    "pid": result.pid,
                 }))?
             );
         } else {
-            println!("daemon already running with pid {pid}");
+            println!("daemon already running with pid {}", result.pid);
         }
         return Ok(());
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "started": true,
+                "pid": result.pid,
+                "log": daemon_log_path(paths),
+            }))?
+        );
+    } else {
+        println!("started daemon pid {}", result.pid);
+        println!("Log: {}", daemon_log_path(paths).display());
+    }
+    Ok(())
+}
+
+fn start_daemon_process(paths: &AppPaths) -> Result<DaemonStartResult> {
+    fs::create_dir_all(&paths.data_dir)?;
+    if let Some(pid) = read_daemon_pid(paths)?
+        && is_process_running(pid)
+    {
+        return Ok(DaemonStartResult {
+            started: false,
+            already_running: true,
+            pid,
+        });
     }
 
     let log = fs::OpenOptions::new()
@@ -1795,9 +2232,9 @@ fn start_daemon(paths: &AppPaths, json: bool) -> Result<()> {
         .open(daemon_log_path(paths))?;
     let err = log.try_clone()?;
     let mut command = std::process::Command::new(std::env::current_exe()?);
+    append_config_override(&mut command, paths);
+    configure_child_process_group(&mut command);
     command
-        .arg("--config")
-        .arg(&paths.config_dir)
         .arg("daemon")
         .arg("run")
         .stdout(std::process::Stdio::from(log))
@@ -1811,20 +2248,11 @@ fn start_daemon(paths: &AppPaths, json: bool) -> Result<()> {
     store.set_setting("daemon.heartbeat_at", &now)?;
     store.set_setting("daemon.last_error", "")?;
 
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "started": true,
-                "pid": child.id(),
-                "log": daemon_log_path(paths),
-            }))?
-        );
-    } else {
-        println!("started daemon pid {}", child.id());
-        println!("Log: {}", daemon_log_path(paths).display());
-    }
-    Ok(())
+    Ok(DaemonStartResult {
+        started: true,
+        already_running: false,
+        pid: child.id(),
+    })
 }
 
 fn stop_daemon(paths: &AppPaths, allow_not_running: bool, json: bool) -> Result<()> {
@@ -1948,9 +2376,10 @@ fn spawn_due_run_executors(paths: &AppPaths, report: &SchedulerTickReport) -> Re
             .append(true)
             .open(daemon_log_path(paths))?;
         let err = log.try_clone()?;
-        std::process::Command::new(std::env::current_exe()?)
-            .arg("--config")
-            .arg(&paths.config_dir)
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        append_config_override(&mut command, paths);
+        configure_child_process_group(&mut command);
+        command
             .arg("daemon")
             .arg("exec-run")
             .arg(run_id.to_string())
@@ -2053,7 +2482,7 @@ fn install_daemon_service(paths: &AppPaths) -> Result<()> {
     let executable = std::env::current_exe()?;
     fs::write(
         &service_path,
-        daemon_service_definition(&executable, &paths.config_dir)?,
+        daemon_service_definition(&executable, paths.config_override.as_deref())?,
     )?;
     println!("installed daemon service file {}", service_path.display());
     Ok(())
@@ -2085,9 +2514,17 @@ fn daemon_service_path() -> Result<PathBuf> {
     }
 }
 
-fn daemon_service_definition(executable: &Path, config_dir: &Path) -> Result<String> {
+fn daemon_service_definition(executable: &Path, config_override: Option<&Path>) -> Result<String> {
     #[cfg(target_os = "macos")]
     {
+        let config_args = config_override
+            .map(|config_dir| {
+                format!(
+                    "    <string>--config</string>\n    <string>{}</string>\n",
+                    xml_escape(&config_dir.display().to_string())
+                )
+            })
+            .unwrap_or_default();
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2098,8 +2535,7 @@ fn daemon_service_definition(executable: &Path, config_dir: &Path) -> Result<Str
   <key>ProgramArguments</key>
   <array>
     <string>{}</string>
-    <string>--config</string>
-    <string>{}</string>
+{}
     <string>daemon</string>
     <string>run</string>
   </array>
@@ -2111,24 +2547,27 @@ fn daemon_service_definition(executable: &Path, config_dir: &Path) -> Result<Str
 </plist>
 "#,
             xml_escape(&executable.display().to_string()),
-            xml_escape(&config_dir.display().to_string())
+            config_args
         ))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let config_args = config_override
+            .map(|config_dir| format!(" --config {}", config_dir.display()))
+            .unwrap_or_default();
         Ok(format!(
             r#"[Unit]
 Description=Scheduler CLI daemon
 
 [Service]
-ExecStart={} --config {} daemon run
+ExecStart={}{} daemon run
 Restart=always
 
 [Install]
 WantedBy=default.target
 "#,
             executable.display(),
-            config_dir.display()
+            config_args
         ))
     }
     #[cfg(not(unix))]
@@ -2139,6 +2578,7 @@ WantedBy=default.target
     }
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -2361,11 +2801,13 @@ struct AppPaths {
     config_dir: PathBuf,
     data_dir: PathBuf,
     database_path: PathBuf,
+    config_override: Option<PathBuf>,
 }
 
 impl AppPaths {
     fn new(config_override: Option<&Path>) -> Result<Self> {
-        let (config_dir, data_dir) = if let Some(config_dir) = config_override {
+        let explicit_config = config_override.map(Path::to_path_buf);
+        let (config_dir, data_dir) = if let Some(config_dir) = &explicit_config {
             let config_dir = config_dir.to_path_buf();
             let data_dir = config_dir.join("data");
             (config_dir, data_dir)
@@ -2382,6 +2824,7 @@ impl AppPaths {
             config_dir,
             data_dir,
             database_path,
+            config_override: explicit_config,
         })
     }
 }
@@ -2390,4 +2833,86 @@ impl AppPaths {
 fn parse_builder_output_for_future_cli_use(input: &str) -> Result<()> {
     parse_spec_builder_envelope(input)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_paths_do_not_emit_config_override_args() {
+        let paths = AppPaths {
+            config_dir: PathBuf::from("/tmp/scheduler-config"),
+            data_dir: PathBuf::from("/tmp/scheduler-data"),
+            database_path: PathBuf::from("/tmp/scheduler-data/scheduler.sqlite3"),
+            config_override: None,
+        };
+
+        assert!(config_override_args(&paths).is_empty());
+    }
+
+    #[test]
+    fn explicit_paths_emit_config_override_args() {
+        let paths = AppPaths::new(Some(Path::new("/tmp/scheduler-dev"))).unwrap();
+        let args = config_override_args(&paths);
+
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], std::ffi::OsString::from("--config"));
+        assert_eq!(args[1], std::ffi::OsString::from("/tmp/scheduler-dev"));
+    }
+
+    #[test]
+    fn status_messages_are_truncated_for_tui_footer() {
+        let message = "x".repeat(240);
+        let truncated = truncate_status_message(&message, 40);
+
+        assert_eq!(truncated.chars().count(), 40);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn spec_builder_ok_requires_job_spec() {
+        let envelope = parse_spec_builder_envelope(
+            r#"{"status":"ok","questions":[],"warnings":[],"summary":null,"job_spec":null}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec_builder_envelope_error(&envelope),
+            Some("status ok requires a non-null job_spec".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_parser_handles_every_five_minutes() {
+        let request = SpecBuildRequest {
+            provider_id: "codex".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            timezone: "Africa/Johannesburg".to_string(),
+            user_request: "scan the repo every 5 minutes for bugs".to_string(),
+        };
+        let (spec, summary) = fallback_spec_from_plain_english(&request).unwrap();
+
+        assert_eq!(spec.provider_id, "codex");
+        assert_eq!(spec.repo.path, "/tmp/repo");
+        assert_eq!(spec.task.prompt, "scan the repo for bugs");
+        assert!(!spec.task.prompt.contains("every 5 minutes"));
+        assert_eq!(spec.execution.timeout_seconds, 300);
+        assert!(summary.is_some());
+        match spec.schedule {
+            ScheduleSpec::Interval {
+                every,
+                unit,
+                timezone,
+                start_at,
+                ..
+            } => {
+                assert_eq!(every, 5);
+                assert_eq!(unit, scheduler_core::IntervalUnit::Minutes);
+                assert_eq!(timezone.as_deref(), Some("Africa/Johannesburg"));
+                assert!(start_at.is_some());
+            }
+            _ => panic!("expected interval schedule"),
+        }
+    }
 }

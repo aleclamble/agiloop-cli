@@ -60,6 +60,7 @@ cargo run -p scheduler-cli -- completions zsh
 
 - [Job spec reference](docs/job-spec-reference.md)
 - [Provider guide](docs/provider-guide.md)
+- [Blocker remediation](docs/blocker-remediation.md)
 - [Release and install](docs/release.md)
 - [Troubleshooting](docs/troubleshooting.md)
 

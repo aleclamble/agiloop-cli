@@ -394,6 +394,7 @@ fn provider_command(paths: &AppPaths, command: ProviderCommand, json: bool) -> R
         } => {
             fs::create_dir_all(&paths.data_dir)?;
             let mut store = Store::open(&paths.database_path)?;
+            let command = normalize_custom_provider_command(command)?;
             let provider = ProviderConfig {
                 display_name: display_name.unwrap_or_else(|| id.clone()),
                 id,
@@ -437,6 +438,16 @@ fn provider_command(paths: &AppPaths, command: ProviderCommand, json: bool) -> R
             Ok(())
         }
     }
+}
+
+fn normalize_custom_provider_command(command: PathBuf) -> Result<PathBuf> {
+    if command.components().count() == 1 {
+        return Ok(command);
+    }
+
+    command
+        .canonicalize()
+        .with_context(|| format!("resolve custom provider command `{}`", command.display()))
 }
 
 fn ensure_detected_provider_exists(store: &mut Store, provider_id: &str) -> Result<()> {

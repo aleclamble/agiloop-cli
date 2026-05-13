@@ -542,17 +542,29 @@ pub fn terminate_process_group(process_group_id: u32) -> Result<(), ProviderErro
 
 #[cfg(unix)]
 fn signal_process_group(process_group_id: u32, signal: &str) -> Result<(), ProviderError> {
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(format!("-{process_group_id}"))
-        .status()
+    let signal = match signal {
+        "TERM" => libc::SIGTERM,
+        "KILL" => libc::SIGKILL,
+        _ => {
+            return Err(ProviderError::Command(format!(
+                "unsupported signal `{signal}`"
+            )));
+        }
+    };
+    let process_group_id = i32::try_from(process_group_id)
         .map_err(|error| ProviderError::Command(error.to_string()))?;
-    if status.success() {
+    let result = unsafe { libc::kill(-process_group_id, signal) };
+    if result == 0 {
         Ok(())
     } else {
-        Err(ProviderError::Command(format!(
-            "kill -{signal} -{process_group_id} exited with status {status}"
-        )))
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(ProviderError::Command(format!(
+                "failed to signal process group {process_group_id}: {error}"
+            )))
+        }
     }
 }
 

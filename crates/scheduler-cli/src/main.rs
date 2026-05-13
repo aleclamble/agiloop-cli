@@ -2138,6 +2138,7 @@ WantedBy=default.target
     }
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")

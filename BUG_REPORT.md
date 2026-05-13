@@ -2,132 +2,74 @@
 
 Generated: 2026-05-13
 
-This report lists the current bugs found by running the repository test suite and
-checking for explicit in-repo bug markers. No `TODO`, `FIXME`, `BUG`, `todo!`, or
-`unimplemented!` markers were present under `crates/`, `docs/`, or `README.md`
-at the time of this audit.
+Scope: current repository state for `aleclamble/agiloop-cli`.
 
-## Audit Commands
+Validation command:
 
-```bash
+```sh
 CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace
-CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace --exclude scheduler-cli
-grep -R "todo!\|unimplemented!\|FIXME\|TODO\|XXX" -n crates docs README.md
 ```
 
-## Summary
+Result: failed in `scheduler-cli` integration tests. The rest of the completed test targets passed before the integration test failure stopped the workspace run.
 
-| ID | Severity | Area | Status |
-| --- | --- | --- | --- |
-| BUG-001 | High | CLI provider execution cancellation | Reproducible test failure |
-| BUG-002 | High | CLI daemon process management | Reproducible test failure |
+## Bugs
 
-The non-CLI workspace tests pass when `scheduler-cli` is excluded: 89 tests
-passed across `scheduler-core`, `scheduler-daemon`, `scheduler-git`,
-`scheduler-logs`, `scheduler-provider`, `scheduler-store`,
-`scheduler-testkit`, and `scheduler-tui`.
+### 1. Cancelling an active custom provider run fails before the run can be cancelled
 
-## BUG-001: Manual Run With Custom Provider Fails Before Cancellation
-
-**Severity:** High
-
-**Affected test:** `cancel_terminates_active_provider_process` in
-`crates/scheduler-cli/tests/cli_smoke.rs`
-
-**Evidence:**
+- Status: open
+- Evidence: `cargo test --workspace` fails `cancel_terminates_active_provider_process`.
+- Failing test: `crates/scheduler-cli/tests/cli_smoke.rs`
+- Runtime area: provider execution and cancellation.
+- Observed failure:
 
 ```text
-thread 'cancel_terminates_active_provider_process' panicked at crates/scheduler-cli/tests/cli_smoke.rs:866:5:
 Error: provider command failed: No such file or directory (os error 2)
 ```
 
-**Expected behavior:**
+Expected behavior: the custom provider run should enter `running`, `scheduler cancel <run_id>` should terminate the provider process group, the CLI child should exit successfully, the run should end in `cancelled`, and the provider marker file should not be created.
 
-A manually started job using a configured custom provider should enter
-`running`, `scheduler cancel <run_id>` should terminate the active provider
-process, the CLI child process should exit successfully, and the run should end
-in `cancelled`.
+Impact: cancellation cannot be trusted for custom provider jobs when the provider process fails to spawn or resolve correctly from the run context. This undermines the CLI's ability to stop active work and may leave run state inconsistent with process state.
 
-**Actual behavior:**
+Likely investigation points:
 
-The run path fails with `provider command failed: No such file or directory`
-before the cancellation flow can complete.
+- `crates/scheduler-provider/src/lib.rs` builds and spawns `ProviderInvocation` values with a `working_dir`.
+- `crates/scheduler-daemon/src/lib.rs` prepares the run context, records process IDs, and transitions runs through `Preparing` and `Running`.
+- `crates/scheduler-cli/tests/cli_smoke.rs` creates an executable temporary provider script and expects that exact command to be runnable during `scheduler run cancellable`.
 
-**Impact:**
+### 2. `daemon start` reports success, but `daemon status` never reports the daemon as running
 
-Active provider process cancellation is listed as implemented in
-`docs/implementation-status.md`, but the CLI smoke test shows that the
-end-to-end cancellation path is currently broken. Users may be unable to cancel
-active custom-provider manual runs reliably.
-
-**Initial investigation notes:**
-
-The test configures a custom executable at a temporary path through
-`scheduler provider add-custom sleeper <path>`, then starts `scheduler run
-cancellable`. The failure indicates that the executable path used by the run
-executor cannot be resolved or spawned by the time execution starts.
-
-## BUG-002: `scheduler daemon start` Does Not Report A Running Background Daemon
-
-**Severity:** High
-
-**Affected test:** `daemon_start_status_and_stop_manage_background_process` in
-`crates/scheduler-cli/tests/cli_smoke.rs`
-
-**Evidence:**
+- Status: open
+- Evidence: `cargo test --workspace` fails `daemon_start_status_and_stop_manage_background_process`.
+- Failing test: `crates/scheduler-cli/tests/cli_smoke.rs`
+- Runtime area: daemon start/status process tracking.
+- Observed failure:
 
 ```text
-thread 'daemon_start_status_and_stop_manage_background_process' panicked at crates/scheduler-cli/tests/cli_smoke.rs:913:5:
-daemon running state did not become `true`; last output: {
+daemon running state did not become `true`; last output:
+{
   "pid": 0,
   "running": false,
-  "database_path": "/tmp/.tmpjZ5i5R/config/data/scheduler.sqlite3",
+  "database_path": ".../scheduler.sqlite3",
   "active_runs": 0,
   "next_due_run": null,
-  "started_at": "2026-05-13T09:28:07.948075459Z",
-  "heartbeat_at": "2026-05-13T09:28:12.007844878Z",
-  "last_tick_at": "2026-05-13T09:28:12.018617170Z",
+  "started_at": "2026-05-13T10:06:26.157928218Z",
+  "heartbeat_at": "2026-05-13T10:06:30.222609845Z",
+  "last_tick_at": "2026-05-13T10:06:30.230903845Z",
   "last_error": ""
 }
 ```
 
-**Expected behavior:**
+Expected behavior: after `scheduler daemon start`, `scheduler daemon status --json` should report `running: true` and a non-zero `pid` while the daemon loop is alive. After `scheduler daemon stop`, status should report `running: false`.
 
-After `scheduler daemon start`, `scheduler daemon status --json` should report
-`running: true` with a non-zero daemon PID. `scheduler daemon stop` should then
-terminate the daemon and status should return `running: false`.
+Impact: daemon health is misreported. The persisted heartbeat and tick timestamps show daemon activity, but process-based status returns `pid: 0` and `running: false`, so operators and scripts may incorrectly conclude the daemon is down.
 
-**Actual behavior:**
+Likely investigation points:
 
-The status output shows heartbeat and tick timestamps, but reports `pid: 0` and
-`running: false`. The test never observes a running daemon within its five-second
-polling window.
+- `crates/scheduler-cli/src/main.rs` writes and reads the daemon PID file with `write_daemon_pid`, `read_daemon_pid`, and `daemon_pid_path`.
+- `daemon_status` trusts the PID file plus `is_process_running(pid)` to set `running`.
+- `run_daemon_loop` also writes the PID file after the background child starts, so there may be a race or PID-file overwrite/visibility problem between `start_daemon`, the child process, and status checks.
 
-**Impact:**
+## Additional Notes
 
-Daemon lifecycle management is listed as implemented in
-`docs/implementation-status.md`, but the CLI smoke test shows that `start` does
-not produce the expected observable background-process state. Users may see a
-daemon that appears stopped even while daemon metadata is being updated, and
-`stop`/`restart` behavior may be unreliable when PID tracking fails.
-
-**Initial investigation notes:**
-
-The daemon status path appears to read heartbeat/tick metadata from SQLite while
-the process-running check depends on a PID file. The mismatch suggests either
-the background process is not persisting its PID correctly, the status command
-cannot read the PID file it expects, or the daemon process exits quickly after
-updating state.
-
-## Passing Baseline Outside CLI Smoke Tests
-
-The following validation passed:
-
-```text
-cargo test --workspace --exclude scheduler-cli
-```
-
-Result: all non-CLI unit and doc tests passed.
-
-The full workspace validation currently fails only in `scheduler-cli` smoke
-coverage because of BUG-001 and BUG-002.
+- The workspace test run also reports a non-fatal warning: `xml_escape` is unused in `crates/scheduler-cli/src/main.rs`.
+- No source fix is included in this report; this file documents the current reproducible bugs found by the repository's test suite.

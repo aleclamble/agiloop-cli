@@ -446,9 +446,7 @@ where
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| ProviderError::Command(error.to_string()))?;
+    let mut child = spawn_provider_command(command, invocation)?;
     let child_id = child.id();
     if let Err(error) = on_spawn(child_id) {
         let _ = terminate_process_group(child_id);
@@ -462,12 +460,16 @@ where
             .stdin
             .take()
             .ok_or_else(|| ProviderError::Command("failed to open provider stdin".to_string()))?;
-        child_stdin
-            .write_all(stdin.as_bytes())
-            .map_err(|error| ProviderError::Command(error.to_string()))?;
-        child_stdin
-            .flush()
-            .map_err(|error| ProviderError::Command(error.to_string()))?;
+        if let Err(error) = child_stdin.write_all(stdin.as_bytes()) {
+            if error.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(ProviderError::Command(error.to_string()));
+            }
+        }
+        if let Err(error) = child_stdin.flush()
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(ProviderError::Command(error.to_string()));
+        }
         drop(child_stdin);
     }
 
@@ -501,6 +503,44 @@ where
             });
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn spawn_provider_command(
+    mut command: Command,
+    invocation: &ProviderInvocation,
+) -> Result<std::process::Child, ProviderError> {
+    match command.spawn() {
+        Ok(child) => Ok(child),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && invocation.command.exists() =>
+        {
+            let mut fallback = Command::new("sh");
+            fallback.arg(&invocation.command).args(&invocation.args);
+            for (key, value) in &invocation.env {
+                fallback.env(key, value);
+            }
+            if let Some(working_dir) = &invocation.working_dir {
+                fallback.current_dir(working_dir);
+            }
+            fallback.stdout(Stdio::piped()).stderr(Stdio::piped());
+            if invocation.stdin.is_some() {
+                fallback.stdin(Stdio::piped());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                fallback.process_group(0);
+            }
+            fallback
+                .spawn()
+                .map_err(|fallback_error| ProviderError::Command(fallback_error.to_string()))
+        }
+        Err(error) => Err(ProviderError::Command(format!(
+            "{}: {}",
+            invocation.command.display(),
+            error
+        ))),
     }
 }
 
@@ -542,25 +582,16 @@ pub fn terminate_process_group(process_group_id: u32) -> Result<(), ProviderErro
 
 #[cfg(unix)]
 fn signal_process_group(process_group_id: u32, signal: &str) -> Result<(), ProviderError> {
-    let signal = match signal {
-        "TERM" => libc::SIGTERM,
-        "KILL" => libc::SIGKILL,
-        _ => {
-            return Err(ProviderError::Command(format!(
-                "unsupported signal `{signal}`"
-            )));
-        }
-    };
-    let process_group = -(process_group_id as libc::pid_t);
-    // Negative pid targets the whole process group, matching `kill -SIGNAL -PGID`
-    // without depending on an external kill binary being present in PATH.
-    let result = unsafe { libc::kill(process_group, signal) };
-    if result == 0 {
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -{signal} -{process_group_id}"))
+        .status()
+        .map_err(|error| ProviderError::Command(error.to_string()))?;
+    if status.success() {
         Ok(())
     } else {
-        let error = std::io::Error::last_os_error();
         Err(ProviderError::Command(format!(
-            "failed to signal process group {process_group_id}: {error}"
+            "kill -{signal} -{process_group_id} exited with status {status}"
         )))
     }
 }

@@ -394,7 +394,6 @@ fn provider_command(paths: &AppPaths, command: ProviderCommand, json: bool) -> R
         } => {
             fs::create_dir_all(&paths.data_dir)?;
             let mut store = Store::open(&paths.database_path)?;
-            let command = normalize_custom_provider_command(command)?;
             let provider = ProviderConfig {
                 display_name: display_name.unwrap_or_else(|| id.clone()),
                 id,
@@ -438,16 +437,6 @@ fn provider_command(paths: &AppPaths, command: ProviderCommand, json: bool) -> R
             Ok(())
         }
     }
-}
-
-fn normalize_custom_provider_command(command: PathBuf) -> Result<PathBuf> {
-    if command.components().count() == 1 {
-        return Ok(command);
-    }
-
-    command
-        .canonicalize()
-        .with_context(|| format!("resolve custom provider command `{}`", command.display()))
 }
 
 fn ensure_detected_provider_exists(store: &mut Store, provider_id: &str) -> Result<()> {
@@ -2013,14 +2002,10 @@ fn clear_daemon_pid(paths: &AppPaths) -> Result<()> {
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    let result = unsafe { libc::kill(pid, 0) };
-    if result == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    std::process::Command::new("sh")
+        .args(["-c", "kill -0 \"$1\"", "scheduler-kill", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(windows)]
@@ -2153,7 +2138,6 @@ WantedBy=default.target
     }
 }
 
-#[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")

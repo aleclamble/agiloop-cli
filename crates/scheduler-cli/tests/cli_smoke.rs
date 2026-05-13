@@ -66,6 +66,94 @@ fn daemon_start_status_and_stop_manage_background_process() {
 }
 
 #[test]
+fn scheduled_job_creation_starts_daemon() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config");
+    let provider = temp.path().join("provider.sh");
+    std::fs::write(&provider, "#!/bin/sh\ncat >/dev/null\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&provider).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&provider, permissions).unwrap();
+    }
+    assert_command_ok(
+        scheduler()
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "provider",
+                "add-custom",
+                "shell",
+                provider.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    let job_spec = temp.path().join("scheduled.json");
+    std::fs::write(
+        &job_spec,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": "scheduler.job.v1",
+            "name": "future-scheduled",
+            "enabled": true,
+            "provider_id": "shell",
+            "repo": {
+                "path": temp.path().display().to_string(),
+                "base_ref": "main",
+                "fetch_before_run": false
+            },
+            "schedule": {
+                "kind": "once",
+                "at": "2099-01-01T00:00:00Z"
+            },
+            "task": {
+                "prompt": "Future run",
+                "success_criteria": []
+            },
+            "execution": {
+                "isolation": "none",
+                "concurrency": "skip",
+                "repo_lock": "none",
+                "timeout_seconds": 10,
+                "approval_policy": "non_interactive",
+                "branch_template": "scheduler/{job_slug}/{run_id}",
+                "worktree_cleanup": {
+                    "on_success": "after_retention",
+                    "on_failure": "keep",
+                    "retention_days": 14
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = scheduler()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "create",
+            "--from-file",
+            job_spec.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_command_ok(output);
+
+    let status = wait_for_daemon_running(config.to_str().unwrap(), true);
+    assert!(status["pid"].as_u64().unwrap_or_default() > 0);
+    assert_command_ok(
+        scheduler()
+            .args(["--config", config.to_str().unwrap(), "daemon", "stop"])
+            .output()
+            .unwrap(),
+    );
+}
+
+#[test]
 fn tui_renders_snapshot_when_stdout_is_not_a_tty() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("config");
@@ -116,15 +204,19 @@ fn cancel_terminates_active_provider_process() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("config");
     let provider = temp.path().join("provider.sh");
+    let ready = temp.path().join("provider-ready");
     let marker = temp.path().join("provider-finished");
     std::fs::write(
         &provider,
         format!(
             r#"#!/bin/sh
 trap 'exit 0' TERM INT
-while :; do sleep 1; done
-touch "{}"
+while IFS= read -r _; do :; done &
+printf ready > "{}"
+/bin/sleep 30
+printf finished > "{}"
 "#,
+            ready.display(),
             marker.display()
         ),
     )
@@ -207,6 +299,7 @@ touch "{}"
         .spawn()
         .unwrap();
     let run_id = wait_for_run_status(config.to_str().unwrap(), "cancellable", "running");
+    wait_for_path(&ready, Duration::from_secs(5));
 
     assert_command_ok(
         scheduler()
@@ -214,7 +307,7 @@ touch "{}"
             .output()
             .unwrap(),
     );
-    wait_for_child_exit(&mut child, Duration::from_secs(15));
+    wait_for_child_exit(&mut child, Duration::from_secs(10));
 
     let final_status = wait_for_run_status(config.to_str().unwrap(), "cancellable", "cancelled");
     assert_eq!(final_status, run_id);
@@ -925,4 +1018,15 @@ fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) {
     }
     let _ = child.kill();
     panic!("child did not exit within {timeout:?}");
+}
+
+fn wait_for_path(path: &std::path::Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("path did not appear within {timeout:?}: {}", path.display());
 }

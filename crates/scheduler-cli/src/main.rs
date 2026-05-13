@@ -1447,15 +1447,11 @@ fn load_tui_model(paths: &AppPaths, state: &TuiState) -> Result<TuiAppModel> {
         chrono::Utc::now(),
     )?;
     match read_daemon_pid(paths)? {
-        Some(pid) => {
+        Some(pid) if is_process_running(pid) => {
             status.pid = pid;
-            let heartbeat_fresh = status
-                .heartbeat_at
-                .map(|heartbeat| chrono::Utc::now() - heartbeat <= chrono::Duration::seconds(3))
-                .unwrap_or(false);
-            status.running = is_process_running(pid) && heartbeat_fresh;
+            status.running = true;
         }
-        None => {
+        _ => {
             status.pid = 0;
             status.running = false;
         }
@@ -1693,15 +1689,11 @@ fn daemon_status(paths: &AppPaths, json: bool) -> Result<()> {
         chrono::Utc::now(),
     )?;
     match read_daemon_pid(paths)? {
-        Some(pid) => {
+        Some(pid) if is_process_running(pid) => {
             status.pid = pid;
-            let heartbeat_fresh = status
-                .heartbeat_at
-                .map(|heartbeat| chrono::Utc::now() - heartbeat <= chrono::Duration::seconds(3))
-                .unwrap_or(false);
-            status.running = is_process_running(pid) && heartbeat_fresh;
+            status.running = true;
         }
-        None => {
+        _ => {
             status.pid = 0;
             status.running = false;
         }
@@ -1859,8 +1851,6 @@ fn stop_daemon(paths: &AppPaths, allow_not_running: bool, json: bool) -> Result<
     clear_daemon_pid(paths)?;
     if paths.database_path.exists() {
         let store = Store::open(&paths.database_path)?;
-        store.set_setting("daemon.pid", "0")?;
-        store.set_setting("daemon.heartbeat_at", "")?;
         store.set_setting("daemon.last_error", "")?;
     }
     if json {
@@ -2012,17 +2002,9 @@ fn clear_daemon_pid(paths: &AppPaths) -> Result<()> {
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
-        && stat
-            .split_whitespace()
-            .nth(2)
-            .is_some_and(|state| state == "Z")
-    {
-        return false;
-    }
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("kill -0 {pid}"))
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -2038,9 +2020,9 @@ fn is_process_running(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn terminate_process(pid: u32) -> Result<()> {
-    let _ = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("kill -TERM {pid}"))
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
         .status();
     for _ in 0..25 {
         if !is_process_running(pid) {
@@ -2048,9 +2030,9 @@ fn terminate_process(pid: u32) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("kill -KILL {pid}"))
+    let _ = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
         .status();
     Ok(())
 }
@@ -2157,6 +2139,7 @@ WantedBy=default.target
     }
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")

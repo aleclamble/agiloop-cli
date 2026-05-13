@@ -462,9 +462,11 @@ where
             .stdin
             .take()
             .ok_or_else(|| ProviderError::Command("failed to open provider stdin".to_string()))?;
-        child_stdin
-            .write_all(stdin.as_bytes())
-            .map_err(|error| ProviderError::Command(error.to_string()))?;
+        if let Err(error) = child_stdin.write_all(stdin.as_bytes())
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(ProviderError::Command(error.to_string()));
+        }
         child_stdin
             .flush()
             .map_err(|error| ProviderError::Command(error.to_string()))?;
@@ -542,29 +544,17 @@ pub fn terminate_process_group(process_group_id: u32) -> Result<(), ProviderErro
 
 #[cfg(unix)]
 fn signal_process_group(process_group_id: u32, signal: &str) -> Result<(), ProviderError> {
-    let signal = match signal {
-        "TERM" => libc::SIGTERM,
-        "KILL" => libc::SIGKILL,
-        _ => {
-            return Err(ProviderError::Command(format!(
-                "unsupported signal `{signal}`"
-            )));
-        }
-    };
-    let process_group_id = i32::try_from(process_group_id)
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(format!("-{process_group_id}"))
+        .status()
         .map_err(|error| ProviderError::Command(error.to_string()))?;
-    let result = unsafe { libc::kill(-process_group_id, signal) };
-    if result == 0 {
+    if status.success() {
         Ok(())
     } else {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(ProviderError::Command(format!(
-                "failed to signal process group {process_group_id}: {error}"
-            )))
-        }
+        Err(ProviderError::Command(format!(
+            "kill -{signal} -{process_group_id} exited with status {status}"
+        )))
     }
 }
 

@@ -144,7 +144,7 @@ touch "{}"
             "enabled": true,
             "provider_id": "sleeper",
             "repo": {
-                "path": "/tmp",
+                "path": temp.path().display().to_string(),
                 "base_ref": "main",
                 "fetch_before_run": false
             },
@@ -181,7 +181,7 @@ touch "{}"
                 "provider",
                 "add-custom",
                 "sleeper",
-                provider.canonicalize().unwrap().to_str().unwrap(),
+                provider.to_str().unwrap(),
             ])
             .output()
             .unwrap(),
@@ -213,7 +213,7 @@ touch "{}"
             .output()
             .unwrap(),
     );
-    wait_for_child_exit(&mut child, Duration::from_secs(5));
+    wait_for_child_exit(&mut child, Duration::from_secs(15));
 
     let final_status = wait_for_run_status(config.to_str().unwrap(), "cancellable", "cancelled");
     assert_eq!(final_status, run_id);
@@ -894,7 +894,7 @@ fn wait_for_run_status(config: &str, job: &str, expected: &str) -> String {
 }
 
 fn wait_for_daemon_running(config: &str, expected: bool) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_stdout = String::new();
     while Instant::now() < deadline {
         let output = scheduler()

@@ -1,81 +1,74 @@
 # Bug Report
 
-Generated on 2026-05-13 from local validation of the current repository state.
+Generated: 2026-05-13
 
-## Summary
+## Scope
 
-The repository currently has three CI-relevant defects:
+This report covers bugs currently observable in the `aleclamble/agiloop-cli` repository checkout. The findings are based on repository inspection and a full workspace test run.
 
-1. `cargo test --workspace` fails in `scheduler-cli` smoke tests.
-2. `cargo clippy --workspace --all-targets -- -D warnings` is expected to fail because `scheduler-cli` has a dead-code warning.
-3. The local validation environment cannot run Clippy because the `clippy` component is not installed for the active Rust toolchain.
+## Validation Run
 
-## Current Bugs
+Command:
 
-### 1. `cancel_terminates_active_provider_process` cannot start the custom provider
+```sh
+CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace
+```
 
-- **Location:** `crates/scheduler-cli/tests/cli_smoke.rs:115`
-- **Validation command:** `CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace`
-- **Observed failure:**
+Result: failed. The workspace compiled, but `scheduler-cli` smoke tests reported two failures:
+
+- `cancel_terminates_active_provider_process`
+- `daemon_start_status_and_stop_manage_background_process`
+
+`cargo clippy --workspace --all-targets -- -D warnings` could not be run because the active Rust toolchain does not have `cargo-clippy` installed.
+
+## Bugs
+
+### 1. Custom provider commands are invoked relative to the job working directory
+
+- Severity: High
+- Status: Reproduced by test failure
+- Affected test: `crates/scheduler-cli/tests/cli_smoke.rs:115`
+- Relevant implementation: `crates/scheduler-provider/src/lib.rs:438` and `crates/scheduler-provider/src/lib.rs:449`
+
+The `cancel_terminates_active_provider_process` smoke test registers a custom provider using a path under a temporary directory, then runs a job whose working directory is also changed before provider execution. The run fails before cancellation can be tested:
 
 ```text
-test cancel_terminates_active_provider_process ... FAILED
-thread 'cancel_terminates_active_provider_process' panicked at crates/scheduler-cli/tests/cli_smoke.rs:866:5:
 Error: provider command failed: No such file or directory (os error 2)
 ```
 
-- **Impact:** The workspace test suite exits with status 101, so the CI `Test` job cannot pass.
-- **Notes:** The test registers a temporary `provider.sh`, creates a job using provider id `sleeper`, then runs the job and expects the provider process to be cancellable. The runtime instead reports that the provider command cannot be found.
+The provider invocation sets `current_dir` to the job working directory before spawning the provider process. If a custom provider command is stored as a relative path, that path is resolved from the job working directory instead of the CLI/config context where it was registered. This makes valid custom provider registrations fail once the job runs somewhere else.
 
-### 2. `daemon_start_status_and_stop_manage_background_process` reports a non-running daemon with heartbeat timestamps
+Expected behavior: a custom provider command registered by path should resolve consistently at execution time, independent of the job working directory. The simplest durable fix is likely to canonicalize or otherwise persist absolute command paths when custom providers are registered, while preserving `PATH` lookup for bare command names.
 
-- **Location:** `crates/scheduler-cli/tests/cli_smoke.rs:30`
-- **Validation command:** `CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace`
-- **Observed failure:**
+Impact: custom provider jobs can fail with `No such file or directory` even though the provider was successfully registered and detected.
 
-```text
-test daemon_start_status_and_stop_manage_background_process ... FAILED
-thread 'daemon_start_status_and_stop_manage_background_process' panicked at crates/scheduler-cli/tests/cli_smoke.rs:913:5:
-daemon running state did not become `true`; last output: {
+### 2. Daemon status can report `running: false` while the daemon is heartbeating
+
+- Severity: Medium
+- Status: Reproduced by test failure
+- Affected test: `crates/scheduler-cli/tests/cli_smoke.rs:42`
+- Relevant implementation: `crates/scheduler-cli/src/main.rs:1691`, `crates/scheduler-cli/src/main.rs:1805`, and `crates/scheduler-daemon/src/lib.rs:92`
+
+The `daemon_start_status_and_stop_manage_background_process` smoke test starts the daemon, then waits for `daemon status` to report `running: true`. The status command timed out with the last observed output showing a live heartbeat and tick timestamp but `running: false` and `pid: 0`:
+
+```json
+{
   "pid": 0,
   "running": false,
   "active_runs": 0,
-  "next_due_run": null,
+  "heartbeat_at": "2026-05-13T13:18:40.064003959Z",
+  "last_tick_at": "2026-05-13T13:18:40.070906917Z",
   "last_error": ""
 }
 ```
 
-- **Impact:** The workspace test suite exits with status 101, so the CI `Test` job cannot pass.
-- **Notes:** The status output includes `started_at`, `heartbeat_at`, and `last_tick_at`, but `pid` remains `0` and `running` remains `false`. This points to daemon start/status bookkeeping rather than an assertion-only issue.
+There is an inconsistency between persisted daemon liveness and PID-file based process detection. `daemon_status_snapshot` treats a recorded heartbeat as running, but the CLI status command overrides that result with `running: false` whenever `read_daemon_pid` returns no valid process. Because the daemon is actively updating heartbeat fields, the PID file appears to be missing, stale, unreadable, or not stable in the test environment.
 
-### 3. `scheduler-cli` has a dead-code warning that is promoted to an error by CI Clippy
+Expected behavior: after `daemon start` returns successfully, `daemon status` should consistently report the spawned daemon as running while the heartbeat is current and the process is alive. The status path should avoid overriding a fresh heartbeat to `false` solely because PID-file detection fails, or it should make PID-file creation/retention reliable enough that the override is trustworthy.
 
-- **Location:** `crates/scheduler-cli/src/main.rs:2142`
-- **Validation command:** `CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo check --workspace`
-- **Observed warning:**
+Impact: operators and automation can see a false negative daemon state, which can lead to duplicate starts, failed health checks, or incorrect operational decisions.
 
-```text
-warning: function `xml_escape` is never used
-    --> crates/scheduler-cli/src/main.rs:2142:4
-     |
-2142 | fn xml_escape(value: &str) -> String {
-     |    ^^^^^^^^^^
-```
+## Additional Notes
 
-- **Impact:** CI runs `cargo clippy --workspace --all-targets -- -D warnings`, so this warning is expected to fail the CI `Clippy` job.
-- **Notes:** The function should either be used by the XML-emitting path or removed if no longer needed.
-
-## Validation Evidence
-
-| Command | Result |
-| --- | --- |
-| `cargo fmt --all -- --check` | Passed |
-| `CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo check --workspace` | Passed with one `dead_code` warning |
-| `CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace` | Failed: 7 passed, 2 failed in `scheduler-cli` smoke tests |
-| `CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo clippy --workspace --all-targets -- -D warnings` | Not runnable locally: `cargo-clippy` is not installed for toolchain `1.91.0-aarch64-unknown-linux-gnu` |
-
-## Recommended Fix Order
-
-1. Fix provider command resolution for custom providers used by job execution.
-2. Fix daemon start/status persistence so a successfully started daemon records a real PID and reports `running: true`.
-3. Remove or wire up `xml_escape`, then rerun Clippy in an environment with the Clippy component installed.
+- The workspace also emits a warning for unused `xml_escape` in `crates/scheduler-cli/src/main.rs:2142` during tests. This is not classified as a runtime bug in this report, but it would become a blocking issue if CI treats warnings as errors.
+- No code fixes were made as part of this report; this file is intended to document the current reproducible bugs and point to the most relevant code paths.

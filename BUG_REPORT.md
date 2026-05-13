@@ -1,47 +1,133 @@
 # Bug Report
 
-Generated on 2026-05-13 from a local audit of `aleclamble/agiloop-cli`.
+Generated: 2026-05-13
 
-## Validation status
+This report lists the current bugs found by running the repository test suite and
+checking for explicit in-repo bug markers. No `TODO`, `FIXME`, `BUG`, `todo!`, or
+`unimplemented!` markers were present under `crates/`, `docs/`, or `README.md`
+at the time of this audit.
 
-- `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` could not complete in this workspace because Cargo could not fetch dependencies from `index.crates.io` (`SSL connect error` after DNS/TLS retry warnings).
-- `cargo test --workspace --offline` could not complete because the local Cargo cache is missing dependencies such as `chrono`.
+## Audit Commands
 
-## Current bugs found
+```bash
+CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace
+CARGO_HOME="$PWD/.escalate-cargo-home" CARGO_TARGET_DIR="$PWD/target" cargo test --workspace --exclude scheduler-cli
+grep -R "todo!\|unimplemented!\|FIXME\|TODO\|XXX" -n crates docs README.md
+```
 
-### 1. Timed-out provider runs can leave descendant processes alive
+## Summary
 
-- Severity: High
-- Area: provider execution and run cancellation
-- Evidence: `crates/scheduler-provider/src/lib.rs:444` creates a Unix process group for provider invocations, and `crates/scheduler-provider/src/lib.rs:507` has `terminate_process_group`, but the timeout path at `crates/scheduler-provider/src/lib.rs:491` only calls `child.kill()`.
-- Impact: if a provider launches child processes, a timeout can kill only the top-level provider process while leaving work running in the background. This can keep modifying a worktree after the scheduler has marked the run timed out.
-- Suggested fix: use `terminate_process_group(child_id)` on timeout before or instead of `child.kill()`, then collect output after the group has been signaled. Add a regression test with a provider script that spawns a long-lived child.
+| ID | Severity | Area | Status |
+| --- | --- | --- | --- |
+| BUG-001 | High | CLI provider execution cancellation | Reproducible test failure |
+| BUG-002 | High | CLI daemon process management | Reproducible test failure |
 
-### 2. Custom providers configured for `prompt_file` are not passed a file path
+The non-CLI workspace tests pass when `scheduler-cli` is excluded: 89 tests
+passed across `scheduler-core`, `scheduler-daemon`, `scheduler-git`,
+`scheduler-logs`, `scheduler-provider`, `scheduler-store`,
+`scheduler-testkit`, and `scheduler-tui`.
 
-- Severity: High
-- Area: custom provider invocation
-- Evidence: `PromptMode::PromptFile` is a public mode, but `prompt_invocation` at `crates/scheduler-provider/src/lib.rs:708` handles it by putting the prompt text on stdin at `crates/scheduler-provider/src/lib.rs:722`.
-- Impact: custom providers that expect a prompt file path cannot work as configured. They receive stdin instead of a filesystem path, making `prompt_file` behavior indistinguishable from `stdin`.
-- Suggested fix: create a temporary prompt file, pass its path using the provider's expected argument contract, and document the exact lifecycle. If the intended behavior is stdin, remove or rename `PromptFile` to avoid a broken public configuration option.
+## BUG-001: Manual Run With Custom Provider Fails Before Cancellation
 
-### 3. Scheduled runs returned as `Start` are created but not transitioned to `Preparing`
+**Severity:** High
 
-- Severity: Medium
-- Area: scheduler tick and run state
-- Evidence: `apply_due_run_policy_with_notifier` creates a run and returns `DueRunAction::Start` at `crates/scheduler-daemon/src/lib.rs:357`, but unlike queued and skipped paths, it does not transition the run status. `start_next_queued_run_if_unblocked` does transition queued runs to `Preparing` at `crates/scheduler-daemon/src/lib.rs:336`.
-- Impact: a caller that relies on tick results alone can leave due runs in their initial status instead of a runnable active state. This makes the state machine inconsistent between immediate scheduled runs and queued runs that later start.
-- Suggested fix: either transition newly started scheduled runs to `Preparing` inside `apply_due_run_policy_with_notifier`, or clearly centralize that transition in the daemon caller and add tests covering scheduled start, queued start, and manual run state progression.
+**Affected test:** `cancel_terminates_active_provider_process` in
+`crates/scheduler-cli/tests/cli_smoke.rs`
 
-### 4. Secret redaction replacement is malformed for bare key patterns
+**Evidence:**
 
-- Severity: Low
-- Area: log redaction
-- Evidence: `crates/scheduler-logs/src/lib.rs:6` and `crates/scheduler-logs/src/lib.rs:7` match bare OpenAI and GitHub token shapes without capture groups, but the replacement at `crates/scheduler-logs/src/lib.rs:12` always uses `$1=[REDACTED]`.
-- Impact: bare secret values are redacted, but the replacement can become `=[REDACTED]`, dropping useful context and making logs harder to read. It also hides which redaction rule fired.
-- Suggested fix: use separate replacements per pattern, for example `"$1=[REDACTED]"` for assignment-style secrets and `"[REDACTED]"` or `"token=[REDACTED]"` for bare token patterns. Add assertions for both `sk-...` and `ghp_...` inputs.
+```text
+thread 'cancel_terminates_active_provider_process' panicked at crates/scheduler-cli/tests/cli_smoke.rs:866:5:
+Error: provider command failed: No such file or directory (os error 2)
+```
 
-## Notes
+**Expected behavior:**
 
-This report is based on code inspection plus the validation commands listed above. A full test run should be retried in an environment with Cargo dependency access before treating this as exhaustive.
+A manually started job using a configured custom provider should enter
+`running`, `scheduler cancel <run_id>` should terminate the active provider
+process, the CLI child process should exit successfully, and the run should end
+in `cancelled`.
+
+**Actual behavior:**
+
+The run path fails with `provider command failed: No such file or directory`
+before the cancellation flow can complete.
+
+**Impact:**
+
+Active provider process cancellation is listed as implemented in
+`docs/implementation-status.md`, but the CLI smoke test shows that the
+end-to-end cancellation path is currently broken. Users may be unable to cancel
+active custom-provider manual runs reliably.
+
+**Initial investigation notes:**
+
+The test configures a custom executable at a temporary path through
+`scheduler provider add-custom sleeper <path>`, then starts `scheduler run
+cancellable`. The failure indicates that the executable path used by the run
+executor cannot be resolved or spawned by the time execution starts.
+
+## BUG-002: `scheduler daemon start` Does Not Report A Running Background Daemon
+
+**Severity:** High
+
+**Affected test:** `daemon_start_status_and_stop_manage_background_process` in
+`crates/scheduler-cli/tests/cli_smoke.rs`
+
+**Evidence:**
+
+```text
+thread 'daemon_start_status_and_stop_manage_background_process' panicked at crates/scheduler-cli/tests/cli_smoke.rs:913:5:
+daemon running state did not become `true`; last output: {
+  "pid": 0,
+  "running": false,
+  "database_path": "/tmp/.tmpjZ5i5R/config/data/scheduler.sqlite3",
+  "active_runs": 0,
+  "next_due_run": null,
+  "started_at": "2026-05-13T09:28:07.948075459Z",
+  "heartbeat_at": "2026-05-13T09:28:12.007844878Z",
+  "last_tick_at": "2026-05-13T09:28:12.018617170Z",
+  "last_error": ""
+}
+```
+
+**Expected behavior:**
+
+After `scheduler daemon start`, `scheduler daemon status --json` should report
+`running: true` with a non-zero daemon PID. `scheduler daemon stop` should then
+terminate the daemon and status should return `running: false`.
+
+**Actual behavior:**
+
+The status output shows heartbeat and tick timestamps, but reports `pid: 0` and
+`running: false`. The test never observes a running daemon within its five-second
+polling window.
+
+**Impact:**
+
+Daemon lifecycle management is listed as implemented in
+`docs/implementation-status.md`, but the CLI smoke test shows that `start` does
+not produce the expected observable background-process state. Users may see a
+daemon that appears stopped even while daemon metadata is being updated, and
+`stop`/`restart` behavior may be unreliable when PID tracking fails.
+
+**Initial investigation notes:**
+
+The daemon status path appears to read heartbeat/tick metadata from SQLite while
+the process-running check depends on a PID file. The mismatch suggests either
+the background process is not persisting its PID correctly, the status command
+cannot read the PID file it expects, or the daemon process exits quickly after
+updating state.
+
+## Passing Baseline Outside CLI Smoke Tests
+
+The following validation passed:
+
+```text
+cargo test --workspace --exclude scheduler-cli
+```
+
+Result: all non-CLI unit and doc tests passed.
+
+The full workspace validation currently fails only in `scheduler-cli` smoke
+coverage because of BUG-001 and BUG-002.

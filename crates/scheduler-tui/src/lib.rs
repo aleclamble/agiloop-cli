@@ -188,7 +188,6 @@ pub enum JobSort {
     Provider,
     Repo,
     State,
-    NextRun,
     LastStatus,
 }
 
@@ -198,8 +197,7 @@ impl JobSort {
             Self::Name => Self::Provider,
             Self::Provider => Self::Repo,
             Self::Repo => Self::State,
-            Self::State => Self::NextRun,
-            Self::NextRun => Self::LastStatus,
+            Self::State => Self::LastStatus,
             Self::LastStatus => Self::Name,
         }
     }
@@ -210,7 +208,6 @@ impl JobSort {
             Self::Provider => "provider",
             Self::Repo => "repo",
             Self::State => "state",
-            Self::NextRun => "next",
             Self::LastStatus => "last",
         }
     }

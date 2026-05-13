@@ -298,6 +298,14 @@ impl BuiltInProviderAdapter {
             }
         }
     }
+
+    fn spec_invocation(&self, prompt: String) -> ProviderInvocation {
+        match self.kind {
+            BuiltInProviderKind::Codex => codex_spec_invocation(&self.command, prompt),
+            BuiltInProviderKind::Claude => claude_spec_invocation(&self.command, prompt),
+            BuiltInProviderKind::OpenCode => opencode_invocation(&self.command, prompt, None),
+        }
+    }
 }
 
 impl ProviderAdapter for BuiltInProviderAdapter {
@@ -322,11 +330,7 @@ impl ProviderAdapter for BuiltInProviderAdapter {
     }
 
     fn build_spec(&self, request: &SpecBuildRequest) -> ProviderInvocation {
-        self.prompt_invocation(
-            build_spec_prompt(request),
-            None,
-            ApprovalPolicy::ProviderDefault,
-        )
+        self.spec_invocation(build_spec_prompt(request))
     }
 
     fn execute_run(&self, request: &RunExecutionRequest) -> ProviderInvocation {
@@ -429,6 +433,19 @@ pub fn run_invocation_with_observer<F>(
 where
     F: FnOnce(u32) -> Result<(), ProviderError>,
 {
+    run_invocation_with_observer_and_cancellation(invocation, timeout, on_spawn, || Ok(false))
+}
+
+pub fn run_invocation_with_observer_and_cancellation<F, C>(
+    invocation: &ProviderInvocation,
+    timeout: Duration,
+    on_spawn: F,
+    mut should_cancel: C,
+) -> Result<ProviderOutput, ProviderError>
+where
+    F: FnOnce(u32) -> Result<(), ProviderError>,
+    C: FnMut() -> Result<bool, ProviderError>,
+{
     let mut command = Command::new(&invocation.command);
     command.args(&invocation.args);
     for (key, value) in &invocation.env {
@@ -488,7 +505,21 @@ where
                 timed_out: false,
             });
         }
+        if should_cancel()? {
+            let _ = terminate_process_group(child_id);
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .map_err(|error| ProviderError::Command(error.to_string()))?;
+            return Ok(ProviderOutput {
+                exit_code: output.status.code(),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                timed_out: false,
+            });
+        }
         if started.elapsed() >= timeout {
+            let _ = terminate_process_group(child_id);
             let _ = child.kill();
             let output = child
                 .wait_with_output()
@@ -574,7 +605,9 @@ Rules:
 - Do not invent repository paths.
 - Do not invent provider IDs.
 - Ask clarification if schedule wording is ambiguous.
-- Keep the task prompt faithful to the user's request.
+- Put schedule/interval wording only in the schedule fields.
+- Keep task.prompt focused on the work to do during one run; do not include phrases like "every 5 minutes" in task.prompt.
+- Keep the task prompt faithful to the non-schedule part of the user's request.
 
 User request:
 {user_request}
@@ -591,7 +624,7 @@ pub fn build_provider_spec_invocation(
     prompt: String,
 ) -> ProviderInvocation {
     if let Some(adapter) = BuiltInProviderAdapter::from_config(provider) {
-        return adapter.prompt_invocation(prompt, None, ApprovalPolicy::ProviderDefault);
+        return adapter.spec_invocation(prompt);
     }
 
     ProviderInvocation {
@@ -657,6 +690,24 @@ fn codex_invocation(
     }
 }
 
+fn codex_spec_invocation(command: &Path, prompt: String) -> ProviderInvocation {
+    ProviderInvocation {
+        command: command.to_path_buf(),
+        args: vec![
+            "exec".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--ignore-user-config".to_string(),
+            "--ignore-rules".to_string(),
+            "--sandbox".to_string(),
+            "read-only".to_string(),
+            "-".to_string(),
+        ],
+        stdin: Some(prompt),
+        working_dir: None,
+        env: vec![],
+    }
+}
+
 fn claude_invocation(
     command: &Path,
     prompt: String,
@@ -687,6 +738,25 @@ fn claude_invocation(
         args,
         stdin: None,
         working_dir,
+        env: vec![],
+    }
+}
+
+fn claude_spec_invocation(command: &Path, prompt: String) -> ProviderInvocation {
+    ProviderInvocation {
+        command: command.to_path_buf(),
+        args: vec![
+            "--print".to_string(),
+            "--output-format".to_string(),
+            "text".to_string(),
+            "--input-format".to_string(),
+            "text".to_string(),
+            "--no-session-persistence".to_string(),
+            "--bare".to_string(),
+            prompt,
+        ],
+        stdin: None,
+        working_dir: None,
         env: vec![],
     }
 }
@@ -843,8 +913,10 @@ mod tests {
             vec![
                 "exec",
                 "--skip-git-repo-check",
+                "--ignore-user-config",
+                "--ignore-rules",
                 "--sandbox",
-                "workspace-write",
+                "read-only",
                 "-"
             ]
         );
@@ -888,6 +960,21 @@ mod tests {
             enabled: true,
             capabilities: ProviderCapability::default(),
         };
+        let spec_invocation = build_provider_spec_invocation(&provider, "make a spec".to_string());
+        assert_eq!(
+            spec_invocation.args,
+            vec![
+                "--print",
+                "--output-format",
+                "text",
+                "--input-format",
+                "text",
+                "--no-session-persistence",
+                "--bare",
+                "make a spec"
+            ]
+        );
+
         let invocation = build_provider_run_invocation(
             &provider,
             &RunExecutionRequest {
@@ -977,7 +1064,10 @@ mod tests {
         let output = run_invocation(
             &ProviderInvocation {
                 command: PathBuf::from("/bin/sh"),
-                args: vec!["-c".to_string(), "cat".to_string()],
+                args: vec![
+                    "-c".to_string(),
+                    "IFS= read -r input; printf %s \"$input\"".to_string(),
+                ],
                 stdin: Some("hello".to_string()),
                 working_dir: None,
                 env: vec![],

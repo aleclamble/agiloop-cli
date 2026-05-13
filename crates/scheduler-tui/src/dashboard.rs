@@ -118,7 +118,7 @@ pub fn draw_app(frame: &mut Frame<'_>, model: &TuiAppModel, state: &TuiState) {
 fn footer_text(state: &TuiState, mode: &str, filter: &str) -> String {
     let message = state.message.as_deref().unwrap_or("");
     let controls = if state.view == TuiView::Create {
-        "Views Left/Right  Fields Tab/Up/Down  Enter create in background  Esc dashboard  q quit"
+        "Views Left/Right  Fields Tab/Up/Down  Enter create in background  x cancel create  Esc dashboard  q quit"
     } else {
         "Views Left/Right or Tab/Shift-Tab  Move Up/Down  Enter select  / filter  Space toggle  n run  q quit"
     };
@@ -154,7 +154,7 @@ fn draw_overview(frame: &mut Frame<'_>, area: Rect, model: &TuiAppModel) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(4),
             Constraint::Percentage(45),
             Constraint::Percentage(55),
         ])
@@ -167,10 +167,6 @@ fn draw_overview(frame: &mut Frame<'_>, area: Rect, model: &TuiAppModel) {
     let metrics = Paragraph::new(vec![
         Line::from(format!("Daemon: {daemon}")),
         Line::from(format!("Active runs: {}", model.active_runs)),
-        Line::from(format!(
-            "Next due: {}",
-            model.next_due_run.as_deref().unwrap_or("-")
-        )),
     ])
     .block(Block::default().title("Overview").borders(Borders::ALL));
     frame.render_widget(metrics, chunks[0]);
@@ -185,7 +181,6 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, model: &TuiAppModel, state: &Tui
             Cell::from(job.name.clone()),
             Cell::from(job.provider_id.clone()),
             Cell::from(job.repo_path.clone()),
-            Cell::from(job.next_due.clone().unwrap_or_else(|| "-".to_string())),
             Cell::from(job.last_status.clone().unwrap_or_else(|| "-".to_string())),
             Cell::from(if job.enabled { "enabled" } else { "disabled" }),
         ])
@@ -196,15 +191,12 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, model: &TuiAppModel, state: &Tui
         [
             Constraint::Percentage(20),
             Constraint::Length(12),
-            Constraint::Percentage(25),
-            Constraint::Percentage(18),
+            Constraint::Percentage(35),
             Constraint::Length(12),
             Constraint::Length(10),
         ],
     )
-    .header(Row::new(vec![
-        "Job", "Provider", "Repo", "Next", "Last", "State",
-    ]))
+    .header(Row::new(vec!["Job", "Provider", "Repo", "Last", "State"]))
     .block(Block::default().title("Jobs").borders(Borders::ALL));
     frame.render_widget(table, area);
 }
@@ -221,10 +213,6 @@ fn draw_job_detail(frame: &mut Frame<'_>, area: Rect, model: &TuiAppModel, state
         Line::from(format!("Provider: {}", job.provider_id)),
         Line::from(format!("Repo: {}", job.repo_path)),
         Line::from(format!("Schedule: {}", job.schedule)),
-        Line::from(format!(
-            "Next due: {}",
-            job.next_due.as_deref().unwrap_or("-")
-        )),
         Line::from(""),
         Line::from("Task"),
         Line::from(job.task.clone()),
@@ -564,6 +552,53 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(buffer.contains("Help"));
+    }
+
+    #[test]
+    fn app_does_not_render_next_due_times() {
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let model = TuiAppModel {
+            daemon_online: true,
+            daemon_pid: Some(42),
+            next_due_run: Some("2026-05-12T08:00:00Z".to_string()),
+            active_runs: 0,
+            jobs: vec![TuiJob {
+                id: "job-1".to_string(),
+                name: "bug-scan".to_string(),
+                enabled: true,
+                provider_id: "codex".to_string(),
+                repo_path: "/tmp/repo".to_string(),
+                schedule: "every 5 minutes".to_string(),
+                task: "Scan for bugs".to_string(),
+                next_due: Some("2026-05-12T08:00:00Z".to_string()),
+                last_status: None,
+            }],
+            runs: vec![],
+            providers: vec![],
+            settings: vec![],
+            selected_run_logs: vec![],
+            selected_run_artifacts: vec![],
+        };
+
+        for view in [TuiView::Dashboard, TuiView::Jobs, TuiView::JobDetail] {
+            let state = TuiState {
+                view,
+                ..TuiState::default()
+            };
+            terminal
+                .draw(|frame| draw_app(frame, &model, &state))
+                .unwrap();
+            let buffer = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(!buffer.contains("Next due"), "{buffer}");
+            assert!(!buffer.contains("2026-05-12T08:00:00Z"), "{buffer}");
+        }
     }
 
     #[test]

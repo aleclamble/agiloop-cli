@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use scheduler_core::{
@@ -12,7 +12,7 @@ use scheduler_git::{GitError, canonicalize_repo, create_worktree, fetch_repo, re
 use scheduler_logs::redact_secrets;
 use scheduler_provider::{
     ProviderConfig, RunExecutionRequest, build_provider_run_invocation,
-    run_invocation_with_observer,
+    run_invocation_with_observer_and_cancellation,
 };
 use scheduler_store::{Store, StoreError};
 use serde::{Deserialize, Serialize};
@@ -1064,7 +1064,9 @@ impl RunExecutor {
             },
         );
         invocation.env = scheduler_env(job_id, run_id, spec, &paths, &working_dir);
-        let output = match run_invocation_with_observer(
+        let cancellation_database_path = self.data_dir.join("scheduler.sqlite3");
+        let mut next_cancel_check = Instant::now();
+        let output = match run_invocation_with_observer_and_cancellation(
             &invocation,
             Duration::from_secs(spec.execution.timeout_seconds),
             |process_id| {
@@ -1075,6 +1077,24 @@ impl RunExecutor {
                     })?;
                 store
                     .transition_run(run_id, RunStatus::Running, None)
+                    .map_err(|error| scheduler_provider::ProviderError::Command(error.to_string()))
+            },
+            move || {
+                let now = Instant::now();
+                if now < next_cancel_check {
+                    return Ok(false);
+                }
+                next_cancel_check = now + Duration::from_millis(100);
+                let store = Store::open(&cancellation_database_path).map_err(|error| {
+                    scheduler_provider::ProviderError::Command(error.to_string())
+                })?;
+                store
+                    .get_run(run_id)
+                    .map(|run| {
+                        run.is_some_and(|run| {
+                            matches!(run.status, RunStatus::Cancelling | RunStatus::Cancelled)
+                        })
+                    })
                     .map_err(|error| scheduler_provider::ProviderError::Command(error.to_string()))
             },
         ) {
@@ -1361,6 +1381,10 @@ pub fn execution_prompt(spec: &JobSpec, paths: &RunContextPaths) -> String {
     format!(
         r#"Execute this scheduled task in the current working directory.
 
+Perform exactly one bounded pass for this run. The scheduler owns recurrence, so do not sleep,
+watch for future intervals, or run your own loop. If the task is broad, inspect the highest-signal
+files and commands you can within this run and summarize any remaining scope.
+
 Task:
 {task}
 
@@ -1376,6 +1400,13 @@ Put durable outputs in:
 {artifacts_dir}
 
 Do not ask interactive questions during scheduled runs. If blocked, write a clear blocked reason and exit non-zero.
+
+If this run is specifically remediating a blocker from another task, issue, branch, or pull request:
+- Do not mutate the original task branch in place.
+- Create the fix on this run's isolated branch/worktree.
+- Commit and push the remediation branch only when delivery mode allows code delivery.
+- Report the original blocked item, remediation branch, validation performed, and what the user must merge.
+- After the remediation is merged by a human, the original blocked item should be rechecked rather than creating a duplicate original task.
 "#,
         task = spec.task.prompt,
         success_criteria = spec

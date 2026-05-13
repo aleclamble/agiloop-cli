@@ -121,6 +121,7 @@ fn cancel_terminates_active_provider_process() {
         &provider,
         format!(
             r#"#!/bin/sh
+trap 'exit 0' TERM INT
 while :; do sleep 1; done
 touch "{}"
 "#,

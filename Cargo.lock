@@ -1143,6 +1143,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "directories",
+ "libc",
  "ratatui",
  "scheduler-core",
  "scheduler-daemon",
@@ -1211,6 +1212,7 @@ name = "scheduler-provider"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libc",
  "scheduler-core",
  "serde",
  "serde_json",

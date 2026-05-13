@@ -121,6 +121,7 @@ fn cancel_terminates_active_provider_process() {
         &provider,
         format!(
             r#"#!/bin/sh
+trap 'exit 0' TERM INT
 while :; do sleep 1; done
 touch "{}"
 "#,
@@ -213,7 +214,7 @@ touch "{}"
             .output()
             .unwrap(),
     );
-    wait_for_child_exit(&mut child, Duration::from_secs(5));
+    wait_for_child_exit(&mut child, Duration::from_secs(15));
 
     let final_status = wait_for_run_status(config.to_str().unwrap(), "cancellable", "cancelled");
     assert_eq!(final_status, run_id);

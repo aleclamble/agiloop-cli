@@ -462,12 +462,16 @@ where
             .stdin
             .take()
             .ok_or_else(|| ProviderError::Command("failed to open provider stdin".to_string()))?;
-        child_stdin
-            .write_all(stdin.as_bytes())
-            .map_err(|error| ProviderError::Command(error.to_string()))?;
-        child_stdin
-            .flush()
-            .map_err(|error| ProviderError::Command(error.to_string()))?;
+        if let Err(error) = child_stdin.write_all(stdin.as_bytes())
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(ProviderError::Command(error.to_string()));
+        }
+        if let Err(error) = child_stdin.flush()
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(ProviderError::Command(error.to_string()));
+        }
         drop(child_stdin);
     }
 
@@ -542,9 +546,14 @@ pub fn terminate_process_group(process_group_id: u32) -> Result<(), ProviderErro
 
 #[cfg(unix)]
 fn signal_process_group(process_group_id: u32, signal: &str) -> Result<(), ProviderError> {
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(format!("-{process_group_id}"))
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            "kill -\"$1\" -\"$2\"",
+            "scheduler-kill",
+            signal,
+            &process_group_id.to_string(),
+        ])
         .status()
         .map_err(|error| ProviderError::Command(error.to_string()))?;
     if status.success() {

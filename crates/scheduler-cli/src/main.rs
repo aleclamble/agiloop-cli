@@ -2002,9 +2002,8 @@ fn clear_daemon_pid(paths: &AppPaths) -> Result<()> {
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
+    std::process::Command::new("sh")
+        .args(["-c", "kill -0 \"$1\"", "scheduler-kill", &pid.to_string()])
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -2139,6 +2138,7 @@ WantedBy=default.target
     }
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
